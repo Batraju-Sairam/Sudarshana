@@ -41,7 +41,7 @@ A powerful Python-based JavaScript reconnaissance tool designed for bug bounty h
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/Batraju-Sairam/sudarshana.git
+   git clone https://github.com/Batraju-Sairam/Sudarshana.git
    cd sudarshana
    ```
 
