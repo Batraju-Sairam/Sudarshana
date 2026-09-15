@@ -2,7 +2,9 @@
 
 A powerful Python-based JavaScript reconnaissance tool designed for bug bounty hunters and security researchers to discover hidden paths, API endpoints, URLs, parameters, candidate secrets, source maps, interesting endpoints, and referenced JavaScript files.
 
-![Sudarshana](assets/sudarshana-demo.gif)
+<p align="center">
+  <img src="./assets/closeup-lord-krishnas-hand-holding-sudarshana-chakra-highlighting-divine-weapons-intricate-design-with-blurred-background-celestial-beings_1288204-2407.avif" alt="Sudarshana Demo" width="900">
+</p>
 
 ## Features
 
