@@ -4,7 +4,7 @@ A straight port of your Python `jsrecon.py` to a single-binary Go CLI, so you
 can ship it as:
 
 ```
-go install github.com/YOUR_USERNAME/jsrecon@latest
+go install github.com/Batraju-Sairam/Sudarshana@latest
 ```
 
 ## Before you push this
@@ -63,6 +63,6 @@ Identical to the Python version:
 jsrecon -i js.txt -m urls,secrets -o out/ -s example.com --aggressive
 ```
 
-Run `jsrecon --help` (or `-h`) for the full flag list — flags work with
+Run `sudarshana --help` (or `-h`) for the full flag list — flags work with
 either one or two dashes (`-silent` and `--silent` both work, so there's no
 need for the dual-registration hack the Python argparse version used).
