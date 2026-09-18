@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sudarshana — concurrent JS reconnaissance for bug bounty workflows.
+JSRecon v5 — concurrent JS reconnaissance for bug bounty workflows.
 
 - Modes (-m): all, paths, urls, secrets, map — comma-separated, e.g. -m urls,secrets
 - Live output prints strictly in js.txt order, filtered to the chosen mode(s)
@@ -508,7 +508,7 @@ def format_secrets(secrets):
 
 def main():
     print_banner()
-    ap = argparse.ArgumentParser(description="Sudarshana v5 — concurrent JS path/URL/secret recon")
+    ap = argparse.ArgumentParser(description="JSRecon v5 — concurrent JS path/URL/secret recon")
     ap.add_argument("-m", "--mode", default="all",
                      help="comma-separated: all,paths,urls,secrets,map — e.g. -m urls,secrets")
     ap.add_argument("-i", "--input", default="js.txt", help="file of JS URLs (or local paths with --local), one per line")
@@ -561,28 +561,67 @@ def main():
     t0 = time.time()
     res = scan(targets, a, inc, exc, show)
 
-    # ── follow one level of JS-referencing-JS links ──
+    # ── recursively follow JS-referencing-JS links until exhausted ──
+    #
+    # No depth limit: every newly discovered in-scope JS URL is scanned,
+    # then JS URLs found inside those files are scanned in the next wave.
+    # followed_js prevents loops such as A -> B -> A and duplicate scanning.
     known = set(targets_all) | set(skipped)
+    followed_js = {u for u in known if get_extension(u) == "js"}
     discovered_js = set()
+
     if not a.no_follow and not a.local:
-        for u in res.urls:
-            if get_extension(u) == "js" and u not in known:
-                discovered_js.add(u)
-        for p, src in res.mapping:
-            if get_extension(p) == "js":
-                try:
-                    full = urljoin(src, p)
-                    if full not in known:
-                        discovered_js.add(full)
-                except Exception:
-                    pass
-        discovered_js = {u for u in discovered_js if in_scope(urlsplit(u).hostname, inc, exc)}
+        wave = 0
+
+        while True:
+            candidates = set()
+
+            # Absolute JS URLs found inside every JS file scanned so far.
+            for u in res.urls:
+                if get_extension(u) == "js" and u not in followed_js:
+                    candidates.add(u)
+
+            # Relative JS paths found inside JS files, resolved against
+            # the source JS URL (e.g. "/chunks/app.js").
+            for p, source in res.mapping:
+                if get_extension(p) == "js":
+                    try:
+                        full = clean_url(urljoin(source, p))
+                        if full and full not in followed_js:
+                            candidates.add(full)
+                    except Exception:
+                        pass
+
+            # Only follow in-scope JS URLs.
+            candidates = {
+                u for u in candidates
+                if in_scope(urlsplit(u).hostname, inc, exc)
+            }
+
+            # Nothing new anywhere in the current scan graph -> finished.
+            if not candidates:
+                break
+
+            wave += 1
+            print(
+                f"\n{Y}[*] Recursive JS wave {wave}: "
+                f"following {len(candidates)} new JS link(s)...{X}"
+            )
+
+            # Mark before scanning. This makes the traversal safe against
+            # circular references and repeated references.
+            followed_js.update(candidates)
+            discovered_js.update(candidates)
+
+            res = scan(
+                sorted(candidates),
+                a, inc, exc, show,
+                res=res,
+                label=f"[new:{wave}] "
+            )
+
     elif a.local and not a.no_follow:
         print(f"{D}[*] --local run: skipping JS-link follow-up (no live URLs to fetch).{X}")
-
-    if discovered_js:
-        print(f"\n{Y}[*] Following {len(discovered_js)} newly discovered JS link(s)...{X}")
-        res = scan(sorted(discovered_js), a, inc, exc, show, res=res, label="[new] ")
 
     elapsed = time.time() - t0
     interesting_all = flag_interesting(res.paths) | flag_interesting(res.urls)
