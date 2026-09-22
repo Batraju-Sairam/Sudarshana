@@ -3,15 +3,36 @@
 JSRecon v5 — concurrent JS reconnaissance for bug bounty workflows.
 
 - Modes (-m): all, paths, urls, secrets, map — comma-separated, e.g. -m urls,secrets
-- Live output prints strictly in js.txt order, filtered to the chosen mode(s)
-- --silent hides failed/empty targets from the live feed; real hits still show
-- Nothing is written to disk unless -o is given; with -o, every file gets a
-  <category>-<DD-MM-YYYY>-<HHMMSS>.txt name from one shared run timestamp
-- Follows one level of JS-referencing-JS links discovered inside scanned files
-  (respecting --scope if given), and records them in new-js-urls-<ts>.txt
+  Modes are STRICT: only the extraction functions needed for the selected
+  categories run at all. The one exception is JS-link discovery for the
+  recursive crawler (see note 3 below).
+- Live output shows a running "[scanned/total] ... remaining ... failed"
+  progress line for every completed target, plus a detailed per-target
+  report unless --silent is set and the target had no hit.
+- Nothing is written to disk unless -o is given. Results are streamed to
+  disk AS SOON AS each JS target finishes (not batched until the end), so
+  a killed/crashed run still leaves partial results on disk. A final pass
+  rewrites the same files with clean, deduplicated, sorted content.
+- -o accepts either a directory name (e.g. `-o results`) or an explicit
+  file path with a recognized extension (e.g. `-o paths.txt`,
+  `-o results/paths.txt`). See build_output_paths()/ResultWriter below.
+- Follows JS-referencing-JS links discovered inside scanned files
+  (respecting --scope if given) using a single dynamic work queue instead
+  of discrete "waves", so newly discovered files are scanned immediately
+  alongside whatever is still in flight, with accurate progress counters.
+  NOTE: because mode selection also gates which regexes run, recursion
+  coverage depends on mode. With "paths" selected, absolute JS URLs are
+  still detected internally purely to keep following links (never shown
+  as URL results). With "urls" selected, relative JS paths are not
+  scanned for (no path regex runs), so only absolute-URL-based recursion
+  happens. With a mode that includes neither ("secrets" alone, say),
+  no link-discovery regex runs at all, so recursion will not extend past
+  whatever was in the input file. Include "paths" and/or "urls" in your
+  mode if you want full recursive coverage.
 """
-import argparse, concurrent.futures as cf, html, json, random, re, subprocess
-import sys, threading, time
+import argparse, concurrent.futures as cf, html, json, os, random, re, subprocess
+import sys, time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, urljoin
@@ -167,26 +188,47 @@ def read_lines(f):
     return [x.strip() for x in p.read_text(errors="ignore").splitlines()
             if x.strip() and not x.lstrip().startswith("#")]
 
+def normalize_domain_token(x):
+    """Turns example.com / *.example.com / *example.com / .example.com
+    all into the bare domain 'example.com', so downstream matching is a
+    single consistent domain/subdomain check rather than ad-hoc wildcard
+    handling (and never an unsafe substring match)."""
+    x = x.strip()
+    if not x:
+        return ""
+    x = re.sub(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', '', x)   # strip scheme
+    x = x.split("/", 1)[0].split(":", 1)[0]               # strip path/port
+    if x.startswith("*."):
+        x = x[2:]
+    elif x.startswith("*"):
+        x = x[1:]
+    if x.startswith("."):
+        x = x[1:]
+    return x.lower().rstrip(".")
+
 def load_scope(s):
     if not s:
         return [], []
     p = Path(s)
     tokens = read_lines(s) if p.exists() and p.is_file() else re.split(r'[,\s]+', s.strip())
     inc, exc = [], []
-    for x in tokens:
-        x = x.strip()
-        if not x or x.startswith("#"):
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok or tok.startswith("#"):
             continue
-        neg = x.startswith("!")
-        x = x[1:].strip() if neg else x
-        x = re.sub(r'^[a-z]+://', '', x, flags=re.I).split("/", 1)[0].split(":", 1)[0].lower().rstrip(".")
-        if x.startswith("*."):
-            x = x[2:]
-        if x:
-            (exc if neg else inc).append(x)
+        neg = tok.startswith("!")
+        if neg:
+            tok = tok[1:].strip()
+        d = normalize_domain_token(tok)
+        if d:
+            (exc if neg else inc).append(d)
     return sorted(set(inc)), sorted(set(exc))
 
 def in_scope(host, inc, exc):
+    """Domain/subdomain match only — never a substring match. This is why
+    'example.com.evil.com', 'notexample.com' and 'evil-example.com' never
+    match a scope of 'example.com' (or any of its wildcard spellings),
+    while 'www.example.com' and 'dev.api.example.com' do."""
     h = (host or "").lower().rstrip(".")
     if any(h == d or h.endswith("." + d) for d in exc):
         return False
@@ -273,18 +315,19 @@ def looks_like_html_document(data):
     return False
 
 # ───────────────────────── extraction ─────────────────────────
+#
+# Paths and URLs are now extracted by two SEPARATE functions (rather than
+# one combined pass) specifically so mode selection can gate each regex
+# independently — see the "run_paths_regex" / "run_url_regex" logic in
+# scan_one() below.
 
-def extract_paths_urls(data, inc, exc, aggressive):
-    ps_strict, us, ps_loose = set(), set(), set()
+def extract_paths(data, aggressive):
+    ps_strict, ps_loose = set(), set()
     for variant in (data, decode_obfuscation(data)):
         for m in PATH_RE.finditer(variant):
             p = clean_path(m.group(1))
             if p:
                 ps_strict.add(p)
-        for m in URL_RE.finditer(variant):
-            u = clean_url(m.group(0))
-            if u and in_scope(urlsplit(u).hostname, inc, exc):
-                us.add(u)
         if aggressive:
             for m in LOOSE_PATH_RE.finditer(variant):
                 if REGEX_LITERAL_CTX.search(variant[max(0, m.start()-20):m.start()]):
@@ -293,8 +336,16 @@ def extract_paths_urls(data, inc, exc, aggressive):
                 if p and any(c.isalpha() for c in p):
                     ps_loose.add(p)
     ps_loose -= ps_strict
-    ps = ps_strict | ps_loose
-    return ps, us, ps_loose
+    return ps_strict | ps_loose, ps_loose
+
+def extract_urls(data, inc, exc):
+    us = set()
+    for variant in (data, decode_obfuscation(data)):
+        for m in URL_RE.finditer(variant):
+            u = clean_url(m.group(0))
+            if u and in_scope(urlsplit(u).hostname, inc, exc):
+                us.add(u)
+    return us
 
 def extract_secrets(data, source):
     hits = []
@@ -347,7 +398,7 @@ def flag_interesting(items):
 
 def print_target_report(src, ok, ps, us, ps_loose, secrets, smaps, params, interesting, show):
     status = f"{G}OK{X}" if ok else f"{R}FAIL{X}"
-    print(f"\n{C}==>{X} [{status}] {src}")
+    print(f"{C}==>{X} [{status}] {src}")
     if not ok:
         return
     shown_anything = False
@@ -390,41 +441,68 @@ def print_target_report(src, ok, ps, us, ps_loose, secrets, smaps, params, inter
 
 class Results:
     def __init__(self):
-        self.lock = threading.Lock()
         self.paths, self.urls, self.secrets = set(), set(), []
         self.sourcemaps, self.params = set(), set()
-        self.mapping, self.url_mapping = [], []
+        self.mapping, self.url_mapping = [], []      # (item, source) pairs, only when map_flag
+        self.mapping_seen = set()                     # dedup for the above during streaming
         self.loose_paths = set()
         self.done, self.errors = 0, []
 
-def scan_one(src, args, inc, exc):
+def scan_one(src, args, inc, exc, show, need_link_discovery):
+    """Fetches one target and extracts ONLY what the selected mode (show)
+    requires. The one exception: if recursive JS-following is active,
+    whichever of path/url detection is needed purely to keep discovering
+    new JS links still runs internally, but anything not in `show` is
+    never merged into the reported/streamed results — see js_candidates."""
     body, code = (read_local(src) if args.local else
                   fetch(src, args.timeout, args.retries, args.delay))
     if body and looks_like_html_document(body):
         body = ""
-    ps, us, ps_loose, smaps, params, secrets = set(), set(), set(), set(), set(), []
-    if body:
-        ps, us, ps_loose = extract_paths_urls(body, inc, exc, args.aggressive)
-        if not args.no_secrets:
-            secrets = extract_secrets(body, src)
-        if not args.no_sourcemap:
-            smaps = extract_sourcemaps(body, src)
-        params = extract_params(body, ps, us)
-    interesting = flag_interesting(ps) | flag_interesting(us)
-    return {"src": src, "body": body, "code": code, "paths": ps, "urls": us,
-            "loose_paths": ps_loose, "sourcemaps": smaps, "params": params,
-            "secrets": secrets, "interesting": interesting}
+    ok = bool(body)
+    ps, us, ps_loose = set(), set(), set()
+    smaps, params, secrets = set(), set(), []
+    js_candidates = set()
 
-def _merge_result(res, item):
-    res.paths.update(item["paths"]); res.urls.update(item["urls"])
-    res.loose_paths.update(item["loose_paths"])
-    res.secrets.extend(item["secrets"]); res.sourcemaps.update(item["sourcemaps"])
-    res.params.update(item["params"])
-    res.mapping += [(p, item["src"]) for p in item["paths"]]
-    res.url_mapping += [(u, item["src"]) for u in item["urls"]]
-    res.done += 1
-    if not item["body"]:
-        res.errors.append(item["src"])
+    if body:
+        run_paths_regex = show["paths"]
+        # Exception: when "paths" is selected but "urls" is not, and we're
+        # still following JS links, we also need to notice absolute JS
+        # URLs internally — purely so recursion doesn't stall — without
+        # ever treating them as requested URL results.
+        run_url_regex = show["urls"] or (need_link_discovery and show["paths"] and not show["urls"])
+
+        ps_all, ps_loose_all = extract_paths(body, args.aggressive) if run_paths_regex else (set(), set())
+        us_all = extract_urls(body, inc, exc) if run_url_regex else set()
+
+        ps = ps_all if show["paths"] else set()
+        ps_loose = ps_loose_all if show["paths"] else set()
+        us = us_all if show["urls"] else set()
+
+        if need_link_discovery:
+            for u in us_all:
+                if get_extension(u) == "js":
+                    js_candidates.add(u)
+            for p in ps_all:
+                if get_extension(p) == "js":
+                    full = clean_url(urljoin(src, p))
+                    if full:
+                        js_candidates.add(full)
+            if js_candidates:
+                js_candidates = {u for u in js_candidates if in_scope(urlsplit(u).hostname, inc, exc)}
+
+        if not args.no_secrets and show["secrets"]:
+            secrets = extract_secrets(body, src)
+        if not args.no_sourcemap and show["sourcemaps"]:
+            smaps = extract_sourcemaps(body, src)
+        if show["params"]:
+            params = extract_params(body, ps_all, us_all)
+
+    interesting = flag_interesting(ps) | flag_interesting(us)
+    body = None  # don't hold the response text in memory once extraction is done
+
+    return {"src": src, "ok": ok, "paths": ps, "urls": us, "loose_paths": ps_loose,
+            "sourcemaps": smaps, "params": params, "secrets": secrets,
+            "interesting": interesting, "js_candidates": js_candidates}
 
 def _has_hit(item, show):
     return bool(
@@ -435,31 +513,140 @@ def _has_hit(item, show):
         (show["sourcemaps"] and item["sourcemaps"])
     )
 
-def scan(targets, args, inc, exc, show, res=None, label=""):
-    """Fetches concurrently; PRINTS strictly in input order so [n/total]
-    always matches the target's position in the list being scanned."""
-    if res is None:
-        res = Results()
+def _merge_and_stream(res, item, writer, show, map_flag):
+    """Folds one target's results into the running totals AND streams the
+    newly-seen items straight to disk (if -o was given), so they survive
+    even if the process is killed before the scan finishes."""
+    src = item["src"]
+    res.done += 1
+    if not item["ok"]:
+        res.errors.append(src)
+
+    if show["paths"] and item["paths"]:
+        new_plain = item["paths"] - res.paths
+        if map_flag:
+            new_rows = [(p, src) for p in item["paths"] if (p, src) not in res.mapping_seen]
+            for row in new_rows:
+                res.mapping_seen.add(row)
+                res.mapping.append(row)
+            writer.stream_items("paths", [f"{p}\t{s}" for p, s in new_rows])
+        else:
+            writer.stream_items("paths", sorted(new_plain))
+        res.paths.update(item["paths"])
+    if show["paths"] and item["loose_paths"]:
+        res.loose_paths.update(item["loose_paths"])
+
+    if show["urls"] and item["urls"]:
+        new_plain_u = item["urls"] - res.urls
+        if map_flag:
+            new_rows_u = [(u, src) for u in item["urls"] if (u, src) not in res.mapping_seen]
+            for row in new_rows_u:
+                res.mapping_seen.add(row)
+                res.url_mapping.append(row)
+            writer.stream_items("urls", [f"{u}\t{s}" for u, s in new_rows_u])
+        else:
+            writer.stream_items("urls", sorted(new_plain_u))
+        res.urls.update(item["urls"])
+
+    if show["secrets"] and item["secrets"]:
+        res.secrets.extend(item["secrets"])
+        writer.stream_secrets(item["secrets"])
+
+    if show["sourcemaps"] and item["sourcemaps"]:
+        new_sm = item["sourcemaps"] - res.sourcemaps
+        if new_sm:
+            writer.stream_items("sourcemaps", sorted(new_sm))
+        res.sourcemaps.update(item["sourcemaps"])
+
+    if show["params"] and item["params"]:
+        new_pr = item["params"] - res.params
+        if new_pr:
+            writer.stream_items("params", sorted(new_pr))
+        res.params.update(item["params"])
+
+def run_engine(targets, targets_all, skipped, args, inc, exc, show, map_flag,
+               need_link_discovery, writer):
+    """Single dynamic work queue: initial targets plus every recursively
+    discovered in-scope JS link are processed through one bounded thread
+    pool, so progress counters ('[scanned/total] ... remaining') stay
+    accurate even as new links are discovered mid-scan, and we never hold
+    Futures for the whole (potentially huge) target list at once."""
+    res = Results()
+    known = set(targets_all) | set(skipped)
+    followed_js = {u for u in known if get_extension(u) == "js"}
+    discovered_js = set()
+
+    to_process = deque(targets)
     total = len(targets)
-    with cf.ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futures = [ex.submit(scan_one, t, args, inc, exc) for t in targets]
-        for idx, fut in enumerate(futures, 1):
-            try:
-                item = fut.result()
-            except Exception:
-                item = {"src": targets[idx - 1], "body": "", "code": 0,
-                        "paths": set(), "urls": set(), "loose_paths": set(),
-                        "sourcemaps": set(), "params": set(), "secrets": [],
-                        "interesting": set()}
-            _merge_result(res, item)
-            found = _has_hit(item, show)
-            if args.silent and not found:
-                continue
-            print(f"{D}{label}[{idx}/{total}]{X}", end="")
-            print_target_report(item["src"], bool(item["body"]), item["paths"], item["urls"],
-                                 item["loose_paths"], item["secrets"], item["sourcemaps"],
-                                 item["params"], item["interesting"], show)
-    return res
+    scanned = 0
+    failed = 0
+
+    window = max(args.threads * 2, args.threads, 1)
+    pending = {}
+    executor = cf.ThreadPoolExecutor(max_workers=args.threads)
+
+    def submit_next():
+        if to_process:
+            t = to_process.popleft()
+            fut = executor.submit(scan_one, t, args, inc, exc, show, need_link_discovery)
+            pending[fut] = t
+
+    try:
+        for _ in range(min(window, len(to_process))):
+            submit_next()
+
+        while pending:
+            done, _ = cf.wait(list(pending.keys()), return_when=cf.FIRST_COMPLETED)
+            for fut in done:
+                src = pending.pop(fut)
+                try:
+                    item = fut.result()
+                except Exception:
+                    item = {"src": src, "ok": False, "paths": set(), "urls": set(),
+                            "loose_paths": set(), "sourcemaps": set(), "params": set(),
+                            "secrets": [], "interesting": set(), "js_candidates": set()}
+
+                scanned += 1
+                if not item["ok"]:
+                    failed += 1
+                is_new = src in discovered_js
+
+                _merge_and_stream(res, item, writer, show, map_flag)
+
+                new_candidates = set()
+                if need_link_discovery:
+                    for cand in item["js_candidates"]:
+                        if cand not in followed_js:
+                            followed_js.add(cand)
+                            discovered_js.add(cand)
+                            new_candidates.add(cand)
+                            to_process.append(cand)
+                            total += 1
+
+                found = _has_hit(item, show)
+                show_detail = (not args.silent) or found
+                remaining = total - scanned
+                progress = (f"{D}[{scanned}/{total}] scanned | {remaining} remaining"
+                            + (f" | {failed} failed" if failed else "") + f"{X}")
+                tag = f"{Y}[new]{X} " if is_new else ""
+                if show_detail:
+                    print(f"\n{tag}{progress}")
+                    print_target_report(item["src"], item["ok"], item["paths"], item["urls"],
+                                         item["loose_paths"], item["secrets"], item["sourcemaps"],
+                                         item["params"], item["interesting"], show)
+                else:
+                    print(progress)
+
+                if new_candidates:
+                    print(f"{Y}[*] +{len(new_candidates)} new in-scope JS link(s) queued "
+                          f"(total: {total}){X}")
+
+                submit_next()
+    finally:
+        executor.shutdown(wait=True)
+
+    res.done = scanned
+    return res, scanned, failed, total, discovered_js
 
 # ───────────────────────── source-map follow-up ─────────────────────────
 
@@ -506,6 +693,143 @@ def format_secrets(secrets):
         out.append("")
     return out
 
+# ───────────────────────── -o : directory-or-file resolution ─────────────────────────
+
+RECOGNIZED_OUTPUT_EXTS = {"txt", "json", "log", "out", "csv", "tsv", "md"}
+
+def classify_output_target(raw):
+    """A name with a recognized extension is a FILE. Anything else
+    (including a bare name with no extension, like `results`) is a
+    DIRECTORY — never a nested '<name>/<name>' file-inside-itself."""
+    p = Path(raw)
+    suffix = p.suffix.lstrip(".").lower()
+    if suffix in RECOGNIZED_OUTPUT_EXTS:
+        return "file", p
+    return "dir", p
+
+def build_output_paths(outdir_arg):
+    if not outdir_arg:
+        return None, None, None
+    kind, p = classify_output_target(outdir_arg)
+    if kind == "file":
+        parent = p.parent
+        if str(parent) in ("", "."):
+            parent = Path(".")
+        return "file", parent, p
+    return "dir", p, None
+
+class ResultWriter:
+    """Owns the on-disk output for the run. During the scan, stream_items()/
+    stream_secrets() append-and-flush(+fsync) newly discovered items the
+    moment they're found. After the scan, main() calls finalize_main_outputs()
+    which rewrites the same paths from scratch with clean, deduplicated,
+    sorted content — using save(), independent of the streaming handles."""
+
+    def __init__(self, kind, base_dir, explicit_file, show, run_ts):
+        self.kind = kind
+        self.base_dir = base_dir
+        self.explicit_file = explicit_file
+        self.run_ts = run_ts
+        self.enabled = kind is not None
+        self.handles = {}
+        self.paths_for = {}
+        self.combined_cats = []
+        self._section_started = set()
+
+        if not self.enabled:
+            return
+        if self.base_dir:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+
+        cats = [c for c in ("paths", "urls", "secrets", "params", "sourcemaps") if show.get(c)]
+
+        if kind == "dir":
+            for c in cats:
+                path = self.base_dir / f"{c}-{run_ts}.txt"
+                self.paths_for[c] = path
+                self.handles[c] = open(path, "w", encoding="utf-8")
+        else:  # explicit file — all selected categories share one file
+            path = self.explicit_file
+            self.paths_for["__combined__"] = path
+            fh = open(path, "w", encoding="utf-8")
+            self.combined_cats = cats
+            for c in cats:
+                self.handles[c] = fh
+
+    def _write_line(self, cat, line):
+        if not self.enabled or cat not in self.handles:
+            return
+        fh = self.handles[cat]
+        if self.kind == "file" and len(self.combined_cats) > 1 and cat not in self._section_started:
+            if self._section_started:
+                fh.write("\n")
+            fh.write(f"# ===== {cat.upper()} =====\n")
+            self._section_started.add(cat)
+        fh.write(line + "\n")
+        try:
+            fh.flush()
+            os.fsync(fh.fileno())
+        except Exception:
+            pass
+
+    def stream_items(self, cat, items):
+        for it in items:
+            self._write_line(cat, it)
+
+    def stream_secrets(self, secrets):
+        for conf, name, snippet, src in secrets:
+            self._write_line("secrets", f"[{conf.upper()}] {name}: {snippet}  (source: {src})")
+
+    def close_streams(self):
+        seen = set()
+        for fh in self.handles.values():
+            if id(fh) not in seen:
+                seen.add(id(fh))
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        self.handles = {}
+
+def finalize_main_outputs(writer, res, show, map_flag):
+    if not writer.enabled:
+        return
+    content = {}
+    if show["paths"]:
+        content["paths"] = ([f"{p}\t{s}" for p, s in sorted(set(res.mapping))] if map_flag
+                             else sorted(res.paths))
+    if show["urls"]:
+        content["urls"] = ([f"{u}\t{s}" for u, s in sorted(set(res.url_mapping))] if map_flag
+                            else sorted(res.urls))
+    if show["secrets"]:
+        content["secrets"] = format_secrets(res.secrets)
+    if show["params"]:
+        content["params"] = sorted(res.params)
+    if show["sourcemaps"]:
+        content["sourcemaps"] = sorted(res.sourcemaps)
+
+    if writer.kind == "dir":
+        for cat, lines in content.items():
+            if cat in writer.paths_for:
+                save(writer.paths_for[cat], lines)
+    else:
+        combined_path = writer.paths_for.get("__combined__")
+        if combined_path is None:
+            return
+        cats = writer.combined_cats
+        multi = len(cats) > 1
+        out_lines = []
+        first = True
+        for cat in cats:
+            lines = content.get(cat, [])
+            if not first:
+                out_lines.append("")
+            first = False
+            if multi:
+                out_lines.append(f"# ===== {cat.upper()} =====")
+            out_lines.extend(lines)
+        save(combined_path, out_lines)
+
 def main():
     print_banner()
     ap = argparse.ArgumentParser(description="JSRecon v5 — concurrent JS path/URL/secret recon")
@@ -513,9 +837,17 @@ def main():
                      help="comma-separated: all,paths,urls,secrets,map — e.g. -m urls,secrets")
     ap.add_argument("-i", "--input", default="js.txt", help="file of JS URLs (or local paths with --local), one per line")
     ap.add_argument("-o", "--outdir", default=None,
-                     help="directory to persist results into. Omit to only print to the terminal.")
+                     help="where to save results. A bare name (e.g. `results`) or any name "
+                          "without a recognized extension is treated as a DIRECTORY that gets "
+                          "created, holding one <category>-<timestamp>.txt file per selected "
+                          "mode. A name with a recognized extension (.txt/.json/.log/.out/.csv/"
+                          ".tsv/.md), e.g. `paths.txt` or `results/paths.txt`, is treated as an "
+                          "exact FILE path (parent directories are created as needed). Omit "
+                          "-o entirely to only print to the terminal.")
     ap.add_argument("-s", "--scope", default=None,
-                     help="scope file OR domain(s) directly, e.g. -s example.com or -s 'example.com,!admin.example.com'")
+                     help="scope file OR domain(s) directly, e.g. -s example.com or -s 'example.com,!admin.example.com'. "
+                          "Wildcard spellings *.example.com / *example.com / .example.com are all "
+                          "equivalent to example.com (domain + subdomains, never a substring match).")
     ap.add_argument("-t", "--timeout", type=int, default=20)
     ap.add_argument("-c", "--threads", type=int, default=4, help="concurrent fetch workers (default 4)")
     ap.add_argument("--delay", type=float, default=0.0, help="base delay before a retry, per worker")
@@ -530,7 +862,8 @@ def main():
     ap.add_argument("--diff", metavar="BASELINE", help="compare against a previous run's saved list (requires -o)")
     ap.add_argument("--no-follow", action="store_true", help="don't auto-scan .js URLs discovered inside scanned JS files")
     ap.add_argument("--silent", "-silent", action="store_true",
-                     help="hide failed/empty targets from live output; real hits still show, in js.txt order. "
+                     help="hide the detailed per-target report for targets with no hit; the "
+                          "running scanned/remaining/failed progress line always still prints. "
                           "Registered under both spellings since a single dash is easy to type by habit.")
     a = ap.parse_args()
 
@@ -544,8 +877,7 @@ def main():
     print(f"{C}[*] Scope:{X} {a.scope or 'OFF — all discovered URLs'}"
           + (f"  {D}(parsed as: {', '.join(inc) or '-'}{' | excl: '+', '.join(exc) if exc else ''}){X}" if a.scope else ""))
     print(f"{C}[*] Threads:{X} {a.threads}  {C}Retries:{X} {a.retries}  "
-          f"{C}Source:{X} {'local files' if a.local else 'remote fetch'}  "
-          f"{C}Save:{X} {a.outdir if a.outdir else D+'off (console only)'+X}")
+          f"{C}Source:{X} {'local files' if a.local else 'remote fetch'}")
 
     targets_all = list(dict.fromkeys(read_lines(a.input)))
     if not targets_all:
@@ -558,107 +890,43 @@ def main():
     if not targets:
         sys.exit(f"{R}[!] Nothing left to scan after extension filtering ({len(skipped)} skipped){X}")
 
-    t0 = time.time()
-    res = scan(targets, a, inc, exc, show)
-
-    # ── recursively follow JS-referencing-JS links until exhausted ──
-    #
-    # No depth limit: every newly discovered in-scope JS URL is scanned,
-    # then JS URLs found inside those files are scanned in the next wave.
-    # followed_js prevents loops such as A -> B -> A and duplicate scanning.
-    known = set(targets_all) | set(skipped)
-    followed_js = {u for u in known if get_extension(u) == "js"}
-    discovered_js = set()
-
-    if not a.no_follow and not a.local:
-        wave = 0
-
-        while True:
-            candidates = set()
-
-            # Absolute JS URLs found inside every JS file scanned so far.
-            for u in res.urls:
-                if get_extension(u) == "js" and u not in followed_js:
-                    candidates.add(u)
-
-            # Relative JS paths found inside JS files, resolved against
-            # the source JS URL (e.g. "/chunks/app.js").
-            for p, source in res.mapping:
-                if get_extension(p) == "js":
-                    try:
-                        full = clean_url(urljoin(source, p))
-                        if full and full not in followed_js:
-                            candidates.add(full)
-                    except Exception:
-                        pass
-
-            # Only follow in-scope JS URLs.
-            candidates = {
-                u for u in candidates
-                if in_scope(urlsplit(u).hostname, inc, exc)
-            }
-
-            # Nothing new anywhere in the current scan graph -> finished.
-            if not candidates:
-                break
-
-            wave += 1
-            print(
-                f"\n{Y}[*] Recursive JS wave {wave}: "
-                f"following {len(candidates)} new JS link(s)...{X}"
-            )
-
-            # Mark before scanning. This makes the traversal safe against
-            # circular references and repeated references.
-            followed_js.update(candidates)
-            discovered_js.update(candidates)
-
-            res = scan(
-                sorted(candidates),
-                a, inc, exc, show,
-                res=res,
-                label=f"[new:{wave}] "
-            )
-
-    elif a.local and not a.no_follow:
+    need_link_discovery = (not a.no_follow) and (not a.local)
+    if a.local and not a.no_follow:
         print(f"{D}[*] --local run: skipping JS-link follow-up (no live URLs to fetch).{X}")
 
+    out_kind, out_base, out_file = build_output_paths(a.outdir)
+    writer = ResultWriter(out_kind, out_base, out_file, show, run_ts)
+    print(f"{C}[*] Save:{X} "
+          + (f"{writer.explicit_file}" if writer.kind == "file" else
+             (f"{writer.base_dir}/" if writer.kind == "dir" else f"{D}off (console only){X}")))
+
+    t0 = time.time()
+    res, scanned, failed, total, discovered_js = run_engine(
+        targets, targets_all, skipped, a, inc, exc, show, map_flag, need_link_discovery, writer)
     elapsed = time.time() - t0
+
+    writer.close_streams()
+    finalize_main_outputs(writer, res, show, map_flag)
+
     interesting_all = flag_interesting(res.paths) | flag_interesting(res.urls)
 
-    if a.outdir:
-        outdir = Path(a.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    if writer.enabled:
+        aux_dir = writer.base_dir if writer.base_dir else Path(".")
 
         def out(name):
-            return outdir / f"{name}-{run_ts}.txt"
+            return aux_dir / f"{name}-{run_ts}.txt"
 
-        if skipped:
-            save(out("skipped-ext"), skipped)
-        if discovered_js:
-            save(out("new-js-urls"), sorted(discovered_js))
-
-        if show["paths"]:
-            if map_flag:
-                save(out("paths"), [f"{p}\t{s}" for p, s in sorted(set(res.mapping))])
-            else:
-                save(out("paths"), sorted(res.paths))
-        if show["urls"]:
-            if map_flag:
-                save(out("urls"), [f"{u}\t{s}" for u, s in sorted(set(res.url_mapping))])
-            else:
-                save(out("urls"), sorted(res.urls))
-        if show["secrets"]:
-            save(out("secrets"), format_secrets(res.secrets))
-        if show["params"]:
-            save(out("params"), sorted(res.params))
-        if show["sourcemaps"]:
-            save(out("sourcemaps"), sorted(res.sourcemaps))
         if "all" in modes:
+            if skipped:
+                save(out("skipped-ext"), skipped)
+            if discovered_js:
+                save(out("new-js-urls"), sorted(discovered_js))
             save(out("interesting"), sorted(interesting_all))
             if res.errors:
                 save(out("errors"), res.errors)
             if a.aggressive:
                 save(out("paths-loose"), sorted(res.loose_paths))
+
             smap_sources = {}
             if a.resolve_sourcemaps and res.sourcemaps:
                 print(f"{Y}[*] Resolving {len(res.sourcemaps)} source map(s)...{X}")
@@ -667,11 +935,14 @@ def main():
                 for u, srcs in smap_sources.items():
                     lines.append(f"# {u}"); lines.extend(srcs)
                 save(out("sourcemap-sources"), lines)
+
             if a.diff:
                 save(out("new-findings"), do_diff(a.diff, res.paths | res.urls))
+
             if a.json:
                 payload = {
-                    "scanned": len(targets), "elapsed_seconds": round(elapsed, 2),
+                    "total_js_urls": total, "scanned": scanned, "failed": failed,
+                    "elapsed_seconds": round(elapsed, 2),
                     "paths": sorted(res.paths), "urls": sorted(res.urls),
                     "loose_paths": sorted(res.loose_paths),
                     "interesting": sorted(interesting_all), "params": sorted(res.params),
@@ -680,18 +951,23 @@ def main():
                     "discovered_js": sorted(discovered_js), "errors": res.errors,
                 }
                 (out("results").with_suffix(".json")).write_text(json.dumps(payload, indent=2))
-        print(f"{G}[+] Results written to {outdir}/ (timestamp {run_ts}){X}")
+
+        print(f"{G}[+] Results written ({run_ts}){X}")
     else:
         print(f"{D}[*] No -o given — nothing written to disk, results shown above only.{X}")
 
     print(f"\n{G}========== COMPLETE ({elapsed:.1f}s) =========={X}")
-    print(f"{C}JS files scanned :{X} {res.done}  ({R}{len(res.errors)} failed{X})"
-          + (f"  {D}({len(skipped)} skipped by ext, {len(discovered_js)} followed){X}" if skipped or discovered_js else ""))
-    print(f"{G}Unique paths     :{X} {len(res.paths)}  ({D}{len(res.loose_paths)} loose{X})  {Y}({len(flag_interesting(res.paths))} interesting){X}")
-    print(f"{M}Unique URLs      :{X} {len(res.urls)}   {Y}({len(flag_interesting(res.urls))} interesting){X}")
+    print(f"{C}Total JS URLs :{X} {total}")
+    print(f"{C}Scanned       :{X} {scanned}")
+    print(f"{R}Failed        :{X} {failed}")
+    print(f"{C}Remaining     :{X} {total - scanned}")
+    print(f"{C}Followed JS   :{X} {len(discovered_js)}"
+          + (f"  {D}({len(skipped)} skipped by ext){X}" if skipped else ""))
+    print(f"{G}Unique paths  :{X} {len(res.paths)}  ({D}{len(res.loose_paths)} loose{X})  {Y}({len(flag_interesting(res.paths))} interesting){X}")
+    print(f"{M}Unique URLs   :{X} {len(res.urls)}   {Y}({len(flag_interesting(res.urls))} interesting){X}")
     print(f"{O}Candidate secrets:{X} {len(res.secrets)}  {D}(unverified — see confidence labels){X}")
-    print(f"{B}Source maps      :{X} {len(res.sourcemaps)}")
-    print(f"{W}Param names      :{X} {len(res.params)}")
+    print(f"{B}Source maps   :{X} {len(res.sourcemaps)}")
+    print(f"{W}Param names   :{X} {len(res.params)}")
 
 if __name__ == "__main__":
     main()
