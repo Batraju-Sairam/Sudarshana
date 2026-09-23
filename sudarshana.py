@@ -17,9 +17,13 @@ JSRecon v5 — concurrent JS reconnaissance for bug bounty workflows.
   file path with a recognized extension (e.g. `-o paths.txt`,
   `-o results/paths.txt`). See build_output_paths()/ResultWriter below.
 - Follows JS-referencing-JS links discovered inside scanned files
-  (respecting --scope if given) using a single dynamic work queue instead
-  of discrete "waves", so newly discovered files are scanned immediately
-  alongside whatever is still in flight, with accurate progress counters.
+  (respecting --scope if given) using a real depth-aware wave engine:
+  depth 0 is the original input, depth 1 is whatever depth 0 discovers,
+  depth 2 is whatever depth 1 discovers, and so on. -d/--depth (default 2)
+  caps how many waves beyond depth 0 get scanned; -d all removes the cap
+  entirely. This applies to every mode, not just paths/urls — see the
+  next note for how mode selection still governs extraction independently
+  of how deep the crawler goes.
   NOTE: because mode selection also gates which regexes run, recursion
   coverage depends on mode. With "paths" selected, absolute JS URLs are
   still detected internally purely to keep following links (never shown
@@ -29,6 +33,9 @@ JSRecon v5 — concurrent JS reconnaissance for bug bounty workflows.
   no link-discovery regex runs at all, so recursion will not extend past
   whatever was in the input file. Include "paths" and/or "urls" in your
   mode if you want full recursive coverage.
+- --save-js streams every newly discovered JS URL (tagged with the depth
+  it was found at) to new-js-urls-<timestamp>.txt the instant it's found —
+  independent of -m and never including the original --input URLs.
 """
 import argparse, concurrent.futures as cf, html, json, os, random, re, subprocess
 import sys, time
@@ -564,26 +571,33 @@ def _merge_and_stream(res, item, writer, show, map_flag):
             writer.stream_items("params", sorted(new_pr))
         res.params.update(item["params"])
 
-def run_engine(targets, targets_all, skipped, args, inc, exc, show, map_flag,
-               need_link_discovery, writer):
-    """Single dynamic work queue: initial targets plus every recursively
-    discovered in-scope JS link are processed through one bounded thread
-    pool, so progress counters ('[scanned/total] ... remaining') stay
-    accurate even as new links are discovered mid-scan, and we never hold
-    Futures for the whole (potentially huge) target list at once."""
-    res = Results()
-    known = set(targets_all) | set(skipped)
-    followed_js = {u for u in known if get_extension(u) == "js"}
-    discovered_js = set()
+def parse_depth(raw):
+    """-d/--depth accepts a positive integer (1,2,3,...) or the literal
+    'all' for unlimited recursion. Anything else (0, negatives, 'abc',
+    'unlimited', ...) is rejected."""
+    s = str(raw).strip().lower()
+    if s == "all":
+        return "all"
+    if re.fullmatch(r'[0-9]+', s) and int(s) >= 1:
+        return int(s)
+    sys.exit(f"{R}[!] Invalid --depth value: {raw!r}. Use a positive integer "
+              f"(1, 2, 3, ...) or 'all'.{X}")
 
-    to_process = deque(targets)
-    total = len(targets)
+def scan_wave(executor, wave_targets, args, inc, exc, show, map_flag, need_link_discovery,
+              writer, current_depth, followed_js, res, save_js, discovered_js_depth):
+    """Scans one depth-wave to completion (bounded concurrency within the
+    wave) and returns (scanned, failed, next_wave_candidates). Newly
+    discovered JS links are recorded/streamed immediately as they're
+    found, regardless of whether depth limiting will allow a further wave
+    to actually scan them."""
+    to_process = deque(wave_targets)
+    total = len(wave_targets)
     scanned = 0
     failed = 0
+    next_candidates = set()
 
     window = max(args.threads * 2, args.threads, 1)
     pending = {}
-    executor = cf.ThreadPoolExecutor(max_workers=args.threads)
 
     def submit_next():
         if to_process:
@@ -591,62 +605,112 @@ def run_engine(targets, targets_all, skipped, args, inc, exc, show, map_flag,
             fut = executor.submit(scan_one, t, args, inc, exc, show, need_link_discovery)
             pending[fut] = t
 
-    try:
-        for _ in range(min(window, len(to_process))):
+    for _ in range(min(window, len(to_process))):
+        submit_next()
+
+    while pending:
+        done, _ = cf.wait(list(pending.keys()), return_when=cf.FIRST_COMPLETED)
+        for fut in done:
+            src = pending.pop(fut)
+            try:
+                item = fut.result()
+            except Exception:
+                item = {"src": src, "ok": False, "paths": set(), "urls": set(),
+                        "loose_paths": set(), "sourcemaps": set(), "params": set(),
+                        "secrets": [], "interesting": set(), "js_candidates": set()}
+
+            scanned += 1
+            if not item["ok"]:
+                failed += 1
+
+            _merge_and_stream(res, item, writer, show, map_flag)
+
+            new_here = set()
+            if need_link_discovery:
+                for cand in item["js_candidates"]:
+                    if cand not in followed_js:
+                        followed_js.add(cand)
+                        discovered_js_depth[cand] = current_depth + 1
+                        if save_js:
+                            writer.stream_discovered_js(cand, current_depth + 1)
+                        new_here.add(cand)
+                        next_candidates.add(cand)
+
+            found = _has_hit(item, show)
+            show_detail = (not args.silent) or found
+            remaining = total - scanned
+            progress = (f"{D}[depth={current_depth}] [{scanned}/{total}] scanned | {remaining} remaining"
+                        + (f" | {failed} failed" if failed else "") + f"{X}")
+            if show_detail:
+                print(f"\n{progress}")
+                print_target_report(item["src"], item["ok"], item["paths"], item["urls"],
+                                     item["loose_paths"], item["secrets"], item["sourcemaps"],
+                                     item["params"], item["interesting"], show)
+            else:
+                print(progress)
+
+            if new_here:
+                print(f"{Y}[*] +{len(new_here)} new in-scope JS link(s) discovered "
+                      f"(would be depth={current_depth + 1}){X}")
+
             submit_next()
 
-        while pending:
-            done, _ = cf.wait(list(pending.keys()), return_when=cf.FIRST_COMPLETED)
-            for fut in done:
-                src = pending.pop(fut)
-                try:
-                    item = fut.result()
-                except Exception:
-                    item = {"src": src, "ok": False, "paths": set(), "urls": set(),
-                            "loose_paths": set(), "sourcemaps": set(), "params": set(),
-                            "secrets": [], "interesting": set(), "js_candidates": set()}
+    return scanned, failed, next_candidates
 
-                scanned += 1
-                if not item["ok"]:
-                    failed += 1
-                is_new = src in discovered_js
+def run_engine(targets, targets_all, skipped, args, inc, exc, show, map_flag,
+               need_link_discovery, writer, save_js, max_depth):
+    """Real depth-aware wave engine (not flatten-then-recurse): depth 0 is
+    the initial input, depth 1 is whatever depth-0 scanning discovers,
+    and so on. Each wave is fully scanned (bounded concurrency within the
+    wave) before the next depth's wave is even built. Recursion stops
+    once a wave at `max_depth` has been scanned (or immediately, for
+    --no-follow/--local), or once a wave discovers nothing new — whichever
+    comes first. `max_depth == 'all'` removes the depth ceiling entirely.
+    Links discovered by a wave are recorded (and streamed, if save_js) as
+    soon as they're found, even if the depth ceiling means they'll never
+    actually be scanned."""
+    res = Results()
+    known = set(targets_all) | set(skipped)
+    followed_js = {u for u in known if get_extension(u) == "js"}
+    discovered_js_depth = {}
 
-                _merge_and_stream(res, item, writer, show, map_flag)
+    initial_count = len(targets)
+    total_scanned = 0
+    total_failed = 0
+    current_depth = 0
+    max_depth_reached = 0
+    wave_targets = list(targets)
 
-                new_candidates = set()
-                if need_link_discovery:
-                    for cand in item["js_candidates"]:
-                        if cand not in followed_js:
-                            followed_js.add(cand)
-                            discovered_js.add(cand)
-                            new_candidates.add(cand)
-                            to_process.append(cand)
-                            total += 1
+    executor = cf.ThreadPoolExecutor(max_workers=args.threads)
+    try:
+        while wave_targets:
+            depth_label = "all" if max_depth == "all" else f"{current_depth}/{max_depth}"
+            print(f"\n{C}[*] --- depth {current_depth} "
+                  f"({'unlimited' if max_depth == 'all' else 'limit ' + str(max_depth)}) "
+                  f"— {len(wave_targets)} target(s) ---{X}")
 
-                found = _has_hit(item, show)
-                show_detail = (not args.silent) or found
-                remaining = total - scanned
-                progress = (f"{D}[{scanned}/{total}] scanned | {remaining} remaining"
-                            + (f" | {failed} failed" if failed else "") + f"{X}")
-                tag = f"{Y}[new]{X} " if is_new else ""
-                if show_detail:
-                    print(f"\n{tag}{progress}")
-                    print_target_report(item["src"], item["ok"], item["paths"], item["urls"],
-                                         item["loose_paths"], item["secrets"], item["sourcemaps"],
-                                         item["params"], item["interesting"], show)
-                else:
-                    print(progress)
+            scanned, failed, next_candidates = scan_wave(
+                executor, wave_targets, args, inc, exc, show, map_flag, need_link_discovery,
+                writer, current_depth, followed_js, res, save_js, discovered_js_depth)
 
-                if new_candidates:
-                    print(f"{Y}[*] +{len(new_candidates)} new in-scope JS link(s) queued "
-                          f"(total: {total}){X}")
+            total_scanned += scanned
+            total_failed += failed
+            max_depth_reached = current_depth
 
-                submit_next()
+            if not need_link_discovery or not next_candidates:
+                break
+            if max_depth != "all" and current_depth >= max_depth:
+                break  # discovered (and already recorded) but depth ceiling reached
+
+            current_depth += 1
+            wave_targets = sorted(next_candidates)
     finally:
         executor.shutdown(wait=True)
 
-    res.done = scanned
-    return res, scanned, failed, total, discovered_js
+    res.done = total_scanned
+    discovered_js_all = set(discovered_js_depth.keys())
+    return (res, total_scanned, total_failed, initial_count, discovered_js_all,
+            discovered_js_depth, max_depth_reached)
 
 # ───────────────────────── source-map follow-up ─────────────────────────
 
@@ -725,7 +789,7 @@ class ResultWriter:
     which rewrites the same paths from scratch with clean, deduplicated,
     sorted content — using save(), independent of the streaming handles."""
 
-    def __init__(self, kind, base_dir, explicit_file, show, run_ts):
+    def __init__(self, kind, base_dir, explicit_file, show, run_ts, save_js=False):
         self.kind = kind
         self.base_dir = base_dir
         self.explicit_file = explicit_file
@@ -735,6 +799,9 @@ class ResultWriter:
         self.paths_for = {}
         self.combined_cats = []
         self._section_started = set()
+        self.save_js = save_js
+        self._js_handle = None
+        self._js_path = None
 
         if not self.enabled:
             return
@@ -755,6 +822,13 @@ class ResultWriter:
             self.combined_cats = cats
             for c in cats:
                 self.handles[c] = fh
+
+        # Discovered-JS output (--save-js) is independent of -m entirely,
+        # and always lives in its own file next to whatever else -o
+        # produces (never merged into an explicit single -o file).
+        if self.save_js:
+            self._js_path = self.base_dir / f"new-js-urls-{run_ts}.txt"
+            self._js_handle = open(self._js_path, "w", encoding="utf-8")
 
     def _write_line(self, cat, line):
         if not self.enabled or cat not in self.handles:
@@ -780,6 +854,19 @@ class ResultWriter:
         for conf, name, snippet, src in secrets:
             self._write_line("secrets", f"[{conf.upper()}] {name}: {snippet}  (source: {src})")
 
+    def stream_discovered_js(self, url, depth):
+        """Called the instant a new in-scope JS link is discovered — before
+        it's even queued for scanning — so --save-js output survives a
+        kill mid-scan just like the other streamed categories."""
+        if not (self.enabled and self._js_handle):
+            return
+        self._js_handle.write(f"[depth={depth}] {url}\n")
+        try:
+            self._js_handle.flush()
+            os.fsync(self._js_handle.fileno())
+        except Exception:
+            pass
+
     def close_streams(self):
         seen = set()
         for fh in self.handles.values():
@@ -790,6 +877,12 @@ class ResultWriter:
                 except Exception:
                     pass
         self.handles = {}
+        if self._js_handle:
+            try:
+                self._js_handle.close()
+            except Exception:
+                pass
+            self._js_handle = None
 
 def finalize_main_outputs(writer, res, show, map_flag):
     if not writer.enabled:
@@ -830,6 +923,17 @@ def finalize_main_outputs(writer, res, show, map_flag):
             out_lines.extend(lines)
         save(combined_path, out_lines)
 
+def finalize_discovered_js(writer, discovered_js_depth):
+    """Rewrites the --save-js file with clean, deduplicated content sorted
+    by depth then URL. discovered_js_depth already has unique keys (a URL
+    is only ever recorded once, at the depth it was first discovered), so
+    this is a formatting pass, not a dedup pass — the dedup already
+    happened live during scan_wave()."""
+    if not (writer.enabled and writer.save_js and writer._js_path):
+        return
+    lines = [f"[depth={d}] {u}" for u, d in sorted(discovered_js_depth.items(), key=lambda kv: (kv[1], kv[0]))]
+    save(writer._js_path, lines)
+
 def main():
     print_banner()
     ap = argparse.ArgumentParser(description="JSRecon v5 — concurrent JS path/URL/secret recon")
@@ -861,6 +965,17 @@ def main():
     ap.add_argument("--json", action="store_true", help="also write results.json (requires -o)")
     ap.add_argument("--diff", metavar="BASELINE", help="compare against a previous run's saved list (requires -o)")
     ap.add_argument("--no-follow", action="store_true", help="don't auto-scan .js URLs discovered inside scanned JS files")
+    ap.add_argument("-d", "--depth", default="2",
+                     help="how many recursion waves to scan beyond the initial input: depth 0 is "
+                          "the input itself, depth 1 is what depth 0 discovers, etc. Accepts a "
+                          "positive integer (1, 2, 3, ...) or 'all' for unlimited recursion until "
+                          "no new in-scope JS links remain. Default: 2. Ignored when --no-follow "
+                          "or --local is set (no recursion happens either way).")
+    ap.add_argument("--save-js", action="store_true",
+                     help="stream every newly (recursively) discovered JS URL to "
+                          "new-js-urls-<timestamp>.txt as soon as it's found, tagged with the "
+                          "depth it was discovered at. Never includes the original --input URLs. "
+                          "Independent of -m: works with any mode. Requires -o.")
     ap.add_argument("--silent", "-silent", action="store_true",
                      help="hide the detailed per-target report for targets with no hit; the "
                           "running scanned/remaining/failed progress line always still prints. "
@@ -870,6 +985,7 @@ def main():
     modes = parse_modes(a.mode)
     show, map_flag = resolve_show(modes)
     inc, exc = load_scope(a.scope)
+    max_depth = parse_depth(a.depth)
     run_ts = datetime.now().strftime("%d-%m-%Y-%H%M%S")
 
     print(f"{C}[*] Mode:{X} {','.join(sorted(modes))}"
@@ -878,6 +994,8 @@ def main():
           + (f"  {D}(parsed as: {', '.join(inc) or '-'}{' | excl: '+', '.join(exc) if exc else ''}){X}" if a.scope else ""))
     print(f"{C}[*] Threads:{X} {a.threads}  {C}Retries:{X} {a.retries}  "
           f"{C}Source:{X} {'local files' if a.local else 'remote fetch'}")
+    print(f"{C}[*] Recursion depth:{X} {'unlimited' if max_depth == 'all' else max_depth}"
+          + (f"  {D}(save-js: on){X}" if a.save_js else ""))
 
     targets_all = list(dict.fromkeys(read_lines(a.input)))
     if not targets_all:
@@ -894,19 +1012,26 @@ def main():
     if a.local and not a.no_follow:
         print(f"{D}[*] --local run: skipping JS-link follow-up (no live URLs to fetch).{X}")
 
+    if a.save_js and not a.outdir:
+        print(f"{Y}[!] --save-js has no effect without -o (nothing is written to disk).{X}")
+
     out_kind, out_base, out_file = build_output_paths(a.outdir)
-    writer = ResultWriter(out_kind, out_base, out_file, show, run_ts)
+    writer = ResultWriter(out_kind, out_base, out_file, show, run_ts, save_js=a.save_js)
     print(f"{C}[*] Save:{X} "
           + (f"{writer.explicit_file}" if writer.kind == "file" else
              (f"{writer.base_dir}/" if writer.kind == "dir" else f"{D}off (console only){X}")))
 
     t0 = time.time()
-    res, scanned, failed, total, discovered_js = run_engine(
-        targets, targets_all, skipped, a, inc, exc, show, map_flag, need_link_discovery, writer)
+    (res, scanned, failed, initial_count, discovered_js,
+     discovered_js_depth, max_depth_reached) = run_engine(
+        targets, targets_all, skipped, a, inc, exc, show, map_flag,
+        need_link_discovery, writer, a.save_js, max_depth)
     elapsed = time.time() - t0
+    total = scanned  # every scanned target (initial + every wave) — nothing is left queued
 
     writer.close_streams()
     finalize_main_outputs(writer, res, show, map_flag)
+    finalize_discovered_js(writer, discovered_js_depth)
 
     interesting_all = flag_interesting(res.paths) | flag_interesting(res.urls)
 
@@ -919,8 +1044,6 @@ def main():
         if "all" in modes:
             if skipped:
                 save(out("skipped-ext"), skipped)
-            if discovered_js:
-                save(out("new-js-urls"), sorted(discovered_js))
             save(out("interesting"), sorted(interesting_all))
             if res.errors:
                 save(out("errors"), res.errors)
@@ -941,14 +1064,17 @@ def main():
 
             if a.json:
                 payload = {
-                    "total_js_urls": total, "scanned": scanned, "failed": failed,
+                    "initial_js_urls": initial_count, "total_scanned": scanned, "failed": failed,
+                    "depth_limit": max_depth, "max_depth_reached": max_depth_reached,
                     "elapsed_seconds": round(elapsed, 2),
                     "paths": sorted(res.paths), "urls": sorted(res.urls),
                     "loose_paths": sorted(res.loose_paths),
                     "interesting": sorted(interesting_all), "params": sorted(res.params),
                     "secrets": [{"confidence": c, "type": n, "match": s, "source": src} for c, n, s, src in res.secrets],
                     "sourcemaps": sorted(res.sourcemaps), "sourcemap_sources": smap_sources,
-                    "discovered_js": sorted(discovered_js), "errors": res.errors,
+                    "discovered_js": sorted(discovered_js),
+                    "discovered_js_by_depth": {u: d for u, d in discovered_js_depth.items()},
+                    "errors": res.errors,
                 }
                 (out("results").with_suffix(".json")).write_text(json.dumps(payload, indent=2))
 
@@ -957,11 +1083,16 @@ def main():
         print(f"{D}[*] No -o given — nothing written to disk, results shown above only.{X}")
 
     print(f"\n{G}========== COMPLETE ({elapsed:.1f}s) =========={X}")
-    print(f"{C}Total JS URLs :{X} {total}")
-    print(f"{C}Scanned       :{X} {scanned}")
-    print(f"{R}Failed        :{X} {failed}")
-    print(f"{C}Remaining     :{X} {total - scanned}")
-    print(f"{C}Followed JS   :{X} {len(discovered_js)}"
+    print(f"{C}Initial JS URLs :{X} {initial_count}")
+    print(f"{C}Total JS scanned:{X} {scanned}")
+    print(f"{R}Failed          :{X} {failed}")
+    print(f"{C}Recursive JS    :{X} {scanned - initial_count}"
+          + (f"  {D}({len(discovered_js)} discovered total"
+             + (", not all scanned — depth limit reached" if len(discovered_js) > scanned - initial_count else "")
+             + f"){X}" if discovered_js else ""))
+    print(f"{C}Max depth       :{X} {max_depth_reached}"
+          + (f"  {D}(limit: {'unlimited' if max_depth == 'all' else max_depth}){X}"))
+    print(f"{C}Remaining       :{X} 0"
           + (f"  {D}({len(skipped)} skipped by ext){X}" if skipped else ""))
     print(f"{G}Unique paths  :{X} {len(res.paths)}  ({D}{len(res.loose_paths)} loose{X})  {Y}({len(flag_interesting(res.paths))} interesting){X}")
     print(f"{M}Unique URLs   :{X} {len(res.urls)}   {Y}({len(flag_interesting(res.urls))} interesting){X}")
